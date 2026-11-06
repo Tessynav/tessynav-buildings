@@ -1,0 +1,9 @@
+{
+  "regions": [
+    { "name": "Quebec South West", "bbox": [-79.80, 44.90, -72.00, 47.50] },
+    { "name": "Quebec South East", "bbox": [-72.00, 44.90, -63.00, 49.60] },
+    { "name": "Quebec North West", "bbox": [-79.80, 47.50, -72.00, 63.00] },
+    { "name": "Quebec North East", "bbox": [-72.00, 49.60, -57.00, 63.00] },
+    { "name": "Quebec Far East",   "bbox": [-63.00, 44.90, -57.00, 49.60] }
+  ]
+}
