@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -32,6 +32,14 @@ jobs:
         run: python3 buildings.py download
       - name: Build building tiles
         run: python3 buildings.py build
+      - name: Record the build (a small note in the repository, so GitHub never pauses the monthly schedule)
+        run: |
+          date -u +"%Y-%m-%dT%H:%MZ" > last-build.txt
+          git config user.name "tessynav-bot"
+          git config user.email "tessynav-bot@users.noreply.github.com"
+          git add last-build.txt
+          git commit -q -m "Building tiles built $(date -u +%F)" || exit 0
+          git push -q
       - name: Free space
         run: rm -rf data && du -sh out
       - uses: actions/upload-pages-artifact@v3
