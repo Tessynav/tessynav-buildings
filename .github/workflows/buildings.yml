@@ -22,14 +22,23 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install tools
-        run: pip install overturemaps shapely pyarrow
+        run: |
+          pip install overturemaps shapely pyarrow osmium
+          sudo apt-get update -q && sudo apt-get install -y -q osmium-tool
       - name: Download Overture buildings
         run: python3 buildings.py download
+      - name: OpenStreetMap heights (where Overture has none)
+        run: |
+          mkdir -p data
+          curl -sSL -o data/quebec.osm.pbf https://download.geofabrik.de/north-america/canada/quebec-latest.osm.pbf
+          osmium tags-filter data/quebec.osm.pbf w/height w/building:levels r/height r/building:levels -o data/osm-heights.osm.pbf --overwrite
+          rm data/quebec.osm.pbf
+          python3 buildings.py osm data/osm-heights.osm.pbf
       - name: Build building tiles
         run: python3 buildings.py build
       - name: Record the build (a small note in the repository, so GitHub never pauses the monthly schedule)
@@ -42,7 +51,7 @@ jobs:
           git push -q
       - name: Free space
         run: rm -rf data && du -sh out
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v4
         with:
           path: out
       - id: deploy
