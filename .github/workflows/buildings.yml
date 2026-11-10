@@ -42,6 +42,7 @@ jobs:
       - name: Build building tiles
         run: python3 buildings.py build
       - name: Record the build (a small note in the repository, so GitHub never pauses the monthly schedule)
+        continue-on-error: true   # (this note must never stop the buildings from being published)
         run: |
           date -u +"%Y-%m-%dT%H:%MZ" > last-build.txt
           git config user.name "tessynav-bot"
