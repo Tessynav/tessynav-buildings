@@ -56,3 +56,5 @@ jobs:
           path: out
       - id: deploy
         uses: actions/deploy-pages@v4
+        with:
+          timeout: 2400000   # (40 minutes: tens of thousands of tile files take longer than the default 10 to publish)
