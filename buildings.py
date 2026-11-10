@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""TessyNav building tiles builder v1 — buildings from Overture Maps (OpenStreetMap + Microsoft + Google + others).
+"""TessyNav building tiles builder v2 — buildings from Overture Maps (OpenStreetMap + Microsoft + Google + others),
+v2: heights from OpenStreetMap where Overture has none (towers drawn as low blocks, like Pointe-Nord on Nuns' Island).
 
 Overture keeps every OpenStreetMap building and fills the gaps with buildings detected from satellite imagery,
 so areas that are nearly empty in OpenStreetMap (many suburbs) get their buildings. Runs on GitHub Actions
 (see .github/workflows/buildings.yml) and publishes with GitHub Pages at https://tessynav.github.io/tessynav-buildings/
 
   python3 buildings.py download   download Overture's buildings for each region in regions.json
+  python3 buildings.py osm        read the heights and floor counts of OpenStreetMap's buildings (osm.pbf)
   python3 buildings.py build      write the tiles into out/
 
 Output:
@@ -30,13 +32,108 @@ def pack_of(lng, lat):
     return math.floor(math.floor(lng / CELL) / PACK), math.floor(math.floor(lat / CELL) / PACK)
 
 
-def height_of(h, floors, area):
-    """the building's height in metres: Overture's height, or its number of floors, or a guess from its size"""
+def known_height(h, floors):
+    """a real height in metres (Overture's height, or its number of floors), or None when it has neither"""
     if h is not None and h == h and 2 <= h <= 600:
         return float(h)
     if floors is not None and floors == floors and 1 <= floors <= 150:
         return 3.2 * floors + 1.0
+    return None
+
+
+def guess_height(area):
     return 6.0 if area < 120 else 8.0 if area < 400 else 10.0 if area < 2500 else 12.0
+
+
+def height_of(h, floors, area):
+    """the building's height in metres: Overture's height, or its number of floors, or a guess from its size"""
+    k = known_height(h, floors)
+    return k if k is not None else guess_height(area)
+
+
+def parse_height(v):
+    """an OpenStreetMap height tag in metres: "45", "45 m", "45.5", "150 ft", "150'" (None if unreadable)"""
+    if not v:
+        return None
+    t = v.strip().lower().replace(',', '.')
+    feet = t.endswith('ft') or t.endswith("'") or 'feet' in t
+    num = ''
+    for ch in t:
+        if ch.isdigit() or ch == '.':
+            num += ch
+        elif num:
+            break
+    try:
+        x = float(num)
+    except ValueError:
+        return None
+    if feet:
+        x *= 0.3048
+    return x if 2 <= x <= 600 else None
+
+
+OSMG = 0.001          # grid of the OpenStreetMap heights: about 80 x 110 m
+
+
+def osm_heights(pbf):
+    """OpenStreetMap buildings (and building parts) that have a height or a number of floors: a point inside each
+    with its height, on a small grid, saved to data/osm_heights.json"""
+    import osmium
+
+    class H(osmium.SimpleHandler):
+        def __init__(self):
+            super().__init__()
+            self.grid, self.n = {}, 0
+
+        def area(self, a):
+            t = a.tags
+            if 'building' not in t and 'building:part' not in t:
+                return
+            h = parse_height(t.get('height'))
+            if h is None:
+                lv = t.get('building:levels')
+                try:
+                    lv = float(lv) if lv is not None else None
+                except ValueError:
+                    lv = None
+                if lv is not None and 1 <= lv <= 150:
+                    h = 3.2 * lv + 1.0
+            if h is None:
+                return
+            try:
+                for ring in a.outer_rings():
+                    pts = [(nd.lon, nd.lat) for nd in ring]
+                    if len(pts) < 3:
+                        continue
+                    x = sum(p[0] for p in pts) / len(pts); y = sum(p[1] for p in pts) / len(pts)
+                    k = '%d_%d' % (math.floor(x / OSMG), math.floor(y / OSMG))
+                    self.grid.setdefault(k, []).append([round(x, 7), round(y, 7), round(h, 1)])
+                    self.n += 1
+            except Exception:
+                pass
+
+    h = H()
+    h.apply_file(pbf, locations=True)
+    os.makedirs(DATA, exist_ok=True)
+    with open(os.path.join(DATA, 'osm_heights.json'), 'w') as fh:
+        json.dump(h.grid, fh)
+    print('OpenStreetMap buildings with a height or floors: %d' % h.n, flush=True)
+
+
+def osm_lookup(grid, poly):
+    """the tallest OpenStreetMap height whose building's middle lies inside this footprint (None if none)"""
+    import shapely
+    if not grid:
+        return None
+    x0, y0, x1, y1 = poly.bounds
+    best = None
+    for gx in range(math.floor(x0 / OSMG), math.floor(x1 / OSMG) + 1):
+        for gy in range(math.floor(y0 / OSMG), math.floor(y1 / OSMG) + 1):
+            for x, y, h in grid.get('%d_%d' % (gx, gy), ()):
+                if x0 <= x <= x1 and y0 <= y <= y1 and shapely.contains_xy(poly, x, y):
+                    if best is None or h > best:
+                        best = h
+    return best
 
 
 def ring_area_m2(ring, lat):
@@ -67,6 +164,13 @@ def build(cfg):
     os.makedirs(os.path.join(OUT, 'b'), exist_ok=True)
     tmp = os.path.join(DATA, 'packs'); os.makedirs(tmp, exist_ok=True)
     total, kept, buf, nbuf = 0, 0, {}, 0
+    # OpenStreetMap heights (step "osm"), used where Overture has none
+    grid = {}
+    gp = os.path.join(DATA, 'osm_heights.json')
+    if os.path.exists(gp):
+        with open(gp) as fh:
+            grid = json.load(fh)
+    from_osm = 0
 
     def flush():
         nonlocal buf, nbuf
@@ -100,7 +204,13 @@ def build(cfg):
                     area = ring_area_m2(ring, c.y)
                     if area < 12:
                         continue          # sheds and noise
-                    hm = height_of(d.get('height', [None] * len(geoms))[i], d.get('num_floors', [None] * len(geoms))[i], area)
+                    hm = known_height(d.get('height', [None] * len(geoms))[i], d.get('num_floors', [None] * len(geoms))[i])
+                    if hm is None:
+                        hm = osm_lookup(grid, p)
+                        if hm is not None:
+                            from_osm += 1
+                        else:
+                            hm = guess_height(area)
                     mh = d.get('min_height', [None] * len(geoms))[i]
                     mf = d.get('min_floor', [None] * len(geoms))[i]
                     base = float(mh) if mh is not None and mh == mh and 0 < mh < hm else (3.2 * mf if mf is not None and mf == mf and mf > 0 and 3.2 * mf < hm else 0.0)
@@ -141,7 +251,7 @@ def build(cfg):
            'buildings': kept, 'packs': npk, 'source': 'Overture Maps Foundation (ODbL / CDLA Permissive 2.0)'}
     with open(os.path.join(OUT, 'index.json'), 'w') as fh:
         json.dump(idx, fh)
-    print('buildings %d of %d, packs %d, %.0f MB' % (kept, total, npk, size / 1e6), flush=True)
+    print('buildings %d of %d, packs %d, %.0f MB; heights from OpenStreetMap where Overture had none: %d' % (kept, total, npk, size / 1e6, from_osm), flush=True)
 
 
 if __name__ == '__main__':
@@ -149,7 +259,9 @@ if __name__ == '__main__':
     step = sys.argv[1] if len(sys.argv) > 1 else 'build'
     if step == 'download':
         download(cfg)
+    elif step == 'osm':
+        osm_heights(sys.argv[2] if len(sys.argv) > 2 else os.path.join(DATA, 'osm-heights.osm.pbf'))
     elif step == 'build':
         build(cfg)
     else:
-        sys.exit('use: buildings.py download | build')
+        sys.exit('use: buildings.py download | osm [file.osm.pbf] | build')
