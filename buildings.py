@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """TessyNav building tiles builder v2 — buildings from Overture Maps (OpenStreetMap + Microsoft + Google + others),
 v2: heights from OpenStreetMap where Overture has none (towers drawn as low blocks, like Pointe-Nord on Nuns' Island).
+v3: building parts (towers in several pieces), roof shapes, building types and colours (packs "v":2 with "m").
 
 Overture keeps every OpenStreetMap building and fills the gaps with buildings detected from satellite imagery,
 so areas that are nearly empty in OpenStreetMap (many suburbs) get their buildings. Runs on GitHub Actions
@@ -73,6 +74,57 @@ def parse_height(v):
 
 
 OSMG = 0.001          # grid of the OpenStreetMap heights: about 80 x 110 m
+
+ROOF = {'gabled': 1, 'gambrel': 1, 'saltbox': 1, 'hipped': 2, 'half_hipped': 2, 'mansard': 2, 'pyramidal': 3,
+        'dome': 4, 'round': 4, 'onion': 4, 'spherical': 4, 'skillion': 5}
+CLS = {}
+for _c, _ks in ((1, 'house detached semidetached_house bungalow cabin farm static_caravan hut'),
+                (2, 'apartments residential terrace dormitory'),
+                (3, 'commercial retail office supermarket kiosk hotel'),
+                (4, 'industrial warehouse manufacture factory'),
+                (5, 'church cathedral chapel mosque temple synagogue shrine monastery religious'),
+                (6, 'school university college kindergarten'),
+                (7, 'hospital civic government public fire_station police'),
+                (8, 'garage garages parking carport')):
+    for _k in _ks.split():
+        CLS[_k] = _c
+SUB = {'commercial': 3, 'industrial': 4, 'religious': 5, 'education': 6, 'civic': 7, 'medical': 7}
+COLOURS = {'white': 0xf2f2f0, 'grey': 0x9a9a9a, 'gray': 0x9a9a9a, 'red': 0xa04030, 'brown': 0x7a5440, 'beige': 0xd8c8a8,
+           'yellow': 0xd8c060, 'black': 0x303030, 'blue': 0x4060a0, 'green': 0x507050, 'silver': 0xc0c0c0, 'tan': 0xc8a878}
+
+
+def colour(v):
+    """an RGB number from "#a1b2c3", "#abc" or a common colour name; -1 when there's none"""
+    if not v or not isinstance(v, str):
+        return -1
+    t = v.strip().lower()
+    if t in COLOURS:
+        return COLOURS[t]
+    if t.startswith('#'):
+        t = t[1:]
+        if len(t) == 3:
+            t = ''.join(ch * 2 for ch in t)
+        if len(t) == 6:
+            try:
+                return int(t, 16)
+            except ValueError:
+                return -1
+    return -1
+
+
+def meta_of(d, i, n, area, hm, base):
+    """[roof shape, type, roof height x10, wall colour, roof colour], or 0 when there's nothing to say"""
+    g = lambda k: d.get(k, [None] * n)[i]
+    cls = CLS.get(str(g('class') or '').lower(), 0) or SUB.get(str(g('subtype') or '').lower(), 0)
+    roof = ROOF.get(str(g('roof_shape') or '').lower(), 0)
+    rh = g('roof_height')
+    rh = round(float(rh) * 10) if rh is not None and rh == rh and 0 < rh < 60 else 0
+    if not roof and cls == 1 and area < 350 and hm <= 12 and base == 0:
+        roof = 9          # (no roof in the data: a house gets a pitched roof, by its shape)
+    wc, rc = colour(g('facade_color')), colour(g('roof_color'))
+    if not (roof or cls or rh or wc >= 0 or rc >= 0):
+        return 0
+    return [roof, cls, rh, wc, rc]
 
 
 def osm_heights(pbf):
@@ -156,6 +208,14 @@ def download(cfg):
         subprocess.run(['overturemaps', 'download', '--bbox=%f,%f,%f,%f' % (w, s, e, n), '-f', 'geoparquet',
                         '--type=building', '-o', out], check=True)
         print('  done in %.0f s, %.0f MB' % (time.time() - t0, os.path.getsize(out) / 1e6), flush=True)
+        # the pieces of buildings made of several parts (a tower on a podium, setbacks); optional
+        outp = os.path.join(DATA, reg['name'].replace(' ', '_') + '_parts.parquet')
+        try:
+            subprocess.run(['overturemaps', 'download', '--bbox=%f,%f,%f,%f' % (w, s, e, n), '-f', 'geoparquet',
+                            '--type=building_part', '-o', outp], check=True)
+            print('  parts: %.0f MB' % (os.path.getsize(outp) / 1e6), flush=True)
+        except Exception as ex:
+            print('  (no building parts: %s)' % ex, flush=True)
 
 
 def build(cfg):
@@ -164,6 +224,7 @@ def build(cfg):
     os.makedirs(os.path.join(OUT, 'b'), exist_ok=True)
     tmp = os.path.join(DATA, 'packs'); os.makedirs(tmp, exist_ok=True)
     total, kept, buf, nbuf = 0, 0, {}, 0
+    nparts = 0
     # OpenStreetMap heights (step "osm"), used where Overture has none
     grid = {}
     gp = os.path.join(DATA, 'osm_heights.json')
@@ -175,16 +236,26 @@ def build(cfg):
     def flush():
         nonlocal buf, nbuf
         for k, rows in buf.items():
+            # (each line: the building, a tab, its details)
             with open(os.path.join(tmp, k + '.jsonl'), 'a') as fh:
                 for r in rows:
                     fh.write(r + '\n')
         buf, nbuf = {}, 0
 
+    WANT = ('geometry', 'height', 'num_floors', 'min_height', 'min_floor', 'class', 'subtype', 'roof_shape',
+            'roof_height', 'roof_color', 'facade_color', 'has_parts')
+    jobs = []
     for reg in cfg['regions']:
-        path = os.path.join(DATA, reg['name'].replace(' ', '_') + '.parquet')
+        base_name = reg['name'].replace(' ', '_')
+        partsp = os.path.join(DATA, base_name + '_parts.parquet')
+        has_parts_file = os.path.exists(partsp)
+        jobs.append((reg, os.path.join(DATA, base_name + '.parquet'), False, has_parts_file))
+        if has_parts_file:
+            jobs.append((reg, partsp, True, True))
+    for reg, path, is_part, parts_ok in jobs:
         pf = pq.ParquetFile(path)
         names = pf.schema_arrow.names
-        cols = [c for c in ('geometry', 'height', 'num_floors', 'min_height', 'min_floor') if c in names]
+        cols = [c for c in WANT if c in names]
         W, S, E, N = reg['bbox']
         for batch in pf.iter_batches(batch_size=20000, columns=cols):
             d = batch.to_pydict()
@@ -192,6 +263,9 @@ def build(cfg):
             for i, g in enumerate(geoms):
                 total += 1
                 if g is None or g.is_empty:
+                    continue
+                # a building drawn as its parts: the parts are used instead of its outline
+                if not is_part and parts_ok and d.get('has_parts', [None] * len(geoms))[i]:
                     continue
                 polys = list(g.geoms) if g.geom_type == 'MultiPolygon' else [g] if g.geom_type == 'Polygon' else []
                 for p in polys:
@@ -229,8 +303,11 @@ def build(cfg):
                     for j in range(1, len(qq)):
                         flat += [qq[j][0] - qq[j - 1][0], qq[j][1] - qq[j - 1][1]]
                     key = '%d_%d' % (px, py)
-                    buf.setdefault(key, []).append(json.dumps(flat, separators=(',', ':')))
+                    mt = meta_of(d, i, len(geoms), area, hm, base)
+                    buf.setdefault(key, []).append(json.dumps(flat, separators=(',', ':')) + '\t' + json.dumps(mt, separators=(',', ':')))
                     nbuf += 1; kept += 1
+                    if is_part:
+                        nparts += 1
             if nbuf > 300000:
                 flush()
             print('  %s: %d read, %d kept' % (reg['name'], total, kept), flush=True)
@@ -242,16 +319,18 @@ def build(cfg):
         px, py = map(int, key.split('_'))
         with open(os.path.join(tmp, f)) as fh:
             rows = fh.read().strip().split('\n')
-        body = '{"v":1,"o":[%s,%s],"b":[%s]}' % (repr(round(px * PACK * CELL, 6)), repr(round(py * PACK * CELL, 6)), ','.join(rows))
+        bs = [r.split('\t')[0] for r in rows]
+        ms = [(r.split('\t') + ['0'])[1] for r in rows]
+        body = '{"v":2,"o":[%s,%s],"b":[%s],"m":[%s]}' % (repr(round(px * PACK * CELL, 6)), repr(round(py * PACK * CELL, 6)), ','.join(bs), ','.join(ms))
         with open(os.path.join(OUT, 'b', key + '.json'), 'w') as out:
             out.write(body)
         npk += 1; size += len(body)
-    idx = {'v': 1, 'date': time.strftime('%Y-%m-%d'), 'cell': CELL, 'pack': PACK, 'q': Q,
+    idx = {'v': 2, 'date': time.strftime('%Y-%m-%d'), 'cell': CELL, 'pack': PACK, 'q': Q,
            'regions': [{'name': r['name'], 'bbox': r['bbox']} for r in cfg['regions']],
            'buildings': kept, 'packs': npk, 'source': 'Overture Maps Foundation (ODbL / CDLA Permissive 2.0)'}
     with open(os.path.join(OUT, 'index.json'), 'w') as fh:
         json.dump(idx, fh)
-    print('buildings %d of %d, packs %d, %.0f MB; heights from OpenStreetMap where Overture had none: %d' % (kept, total, npk, size / 1e6, from_osm), flush=True)
+    print('buildings %d of %d (of which building parts: %d), packs %d, %.0f MB; heights from OpenStreetMap where Overture had none: %d' % (kept, total, nparts, npk, size / 1e6, from_osm), flush=True)
 
 
 if __name__ == '__main__':
